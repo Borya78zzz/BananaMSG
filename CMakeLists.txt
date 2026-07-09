@@ -11,7 +11,7 @@ if (WIN32)
     target_include_directories(messenger PRIVATE "D:/Msydk/ucrt64/include")
     target_link_directories(messenger PRIVATE "D:/Msydk/ucrt64/lib")
     # Добавили ws2_32 и wsock32 для работы с сетью на Windows
-    target_link_libraries(messenger PRIVATE sodium ws2_32 wsock32)
+    target_link_libraries(messenger pthread sodium miniupnpc ws2_32)
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(SODIUM REQUIRED libsodium)
