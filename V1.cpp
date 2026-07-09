@@ -7,16 +7,26 @@
 #include <sstream>
 #include <sodium.h>
 #include <boost/asio.hpp>
-
+#include <miniupnpc/miniupnpc.h>
+#include <miniupnpc/upnpcommands.h>
+#include <miniupnpc/upnperrors.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif
 
 using tcp = boost::asio::ip::tcp;
 
+// Структура для контактов
 struct Contact {
     std::string name;
     std::string ip;
+};
+
+// Структура для сохранения данных сессии UPnP, чтобы закрыть порт при выходе
+struct UPnPContext {
+    struct UPNPUrls urls;
+    struct IGDdatas data;
+    bool is_valid = false;
 };
 
 // Класс, отвечающий за шифрование сессии
@@ -104,7 +114,7 @@ std::vector<Contact> load_contacts() {
     return contacts;
 }
 
-// Правильное чтение русского языка
+// Правильное чтение русского языка из консоли Windows
 std::string get_user_input() {
 #ifdef _WIN32
     HANDLE hConsole = GetStdHandle(STD_INPUT_HANDLE);
@@ -126,6 +136,7 @@ std::string get_user_input() {
 #endif
 }
 
+// Поток для постоянного приема сообщений
 void receive_loop(tcp::socket* socket, SecureSession* session) {
     try {
         while (true) {
@@ -144,10 +155,70 @@ void receive_loop(tcp::socket* socket, SecureSession* session) {
     }
 }
 
+// Функция открывает порт и возвращает контекст для последующего закрытия
+UPnPContext openPortUPnP(const char* port) {
+    UPnPContext ctx;
+    struct UPNPDev *devlist;
+    char lanaddr[64];
+    char externalIPAddress[40];
+    int error = 0;
+
+    std::cout << "\n[UPnP] Ищем роутер в локальной сети для автопроброса..." << std::endl;
+    devlist = upnpDiscover(2000, nullptr, nullptr, 0, 0, 2, &error);
+    
+    if (devlist) {
+        int status = UPNP_GetValidIGD(devlist, &ctx.urls, &ctx.data, lanaddr, sizeof(lanaddr), externalIPAddress, sizeof(externalIPAddress));
+        if (status == 1 || status == 2) {
+            std::cout << "[UPnP] Роутер найден! Наш локальный IP: " << lanaddr << std::endl;
+
+            UPNP_GetExternalIPAddress(ctx.urls.controlURL, ctx.data.first.servicetype, externalIPAddress);
+            std::cout << "[UPnP] Твой внешний IP: " << externalIPAddress << "\n[UPnP] Скинь его другу для подключения!" << std::endl;
+
+            error = UPNP_AddPortMapping(ctx.urls.controlURL, ctx.data.first.servicetype,
+                                        port, port, lanaddr,
+                                        "BananaMessenger", "TCP", nullptr, "0");
+
+            if (error == UPNPCOMMAND_SUCCESS) {
+                std::cout << "[UPnP] УСПЕХ! Порт " << port << " автоматически открыт на роутере." << std::endl;
+                ctx.is_valid = true;
+            } else {
+                std::cout << "[UPnP] Ошибка открытия端口: " << strupnperror(error) << std::endl;
+                FreeUPNPUrls(&ctx.urls);
+            }
+        } else {
+            std::cout << "[UPnP] Роутер не поддерживает UPnP или функция отключена в его админке." << std::endl;
+        }
+        freeUPNPDevlist(devlist);
+    } else {
+        std::cout << "[UPnP] Роутер не найден. Проверь подключение к Wi-Fi/кабелю." << std::endl;
+    }
+    return ctx;
+}
+
+// Функция закрывает ранее открытый порт
+void closePortUPnP(UPnPContext& ctx, const char* port) {
+    if (!ctx.is_valid) return;
+
+    std::cout << "\n[UPnP] Закрываем порт " << port << " на роутере..." << std::endl;
+    int error = UPNP_DeletePortMapping(ctx.urls.controlURL, ctx.data.first.servicetype, port, "TCP", nullptr);
+    
+    if (error == UPNPCOMMAND_SUCCESS) {
+        std::cout << "[UPnP] Порт успешно закрыт. Безопасность восстановлена!" << std::endl;
+    } else {
+        std::cout << "[UPnP] Не удалось закрыть порт на роутере: " << strupnperror(error) << std::endl;
+    }
+
+    FreeUPNPUrls(&ctx.urls);
+    ctx.is_valid = false;
+}
+
 int main() {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
+
+    UPnPContext upnp_ctx;
+    const char* port_str = "55555"; // Можешь поменять порт
 
     try {
         SecureSession session;
@@ -173,8 +244,11 @@ int main() {
             }
 
             if (choice == 1) {
-                tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), 8080));
-                std::cout << "Ожидание подключения на порту 8080...\n";
+                // Пробиваем порт в роутере ТОЛЬКО когда становимся сервером
+                upnp_ctx = openPortUPnP(port_str);
+
+                tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), 55555));
+                std::cout << "Ожидание подключения на порту 55555...\n";
                 acceptor.accept(socket);
                 std::cout << "Клиент подключился!\n";
                 break;
@@ -211,8 +285,8 @@ int main() {
         }
 
         if (!target_ip.empty()) {
-            std::cout << "Подключение к " << target_ip << ":8080...\n";
-            socket.connect(tcp::endpoint(boost::asio::ip::make_address(target_ip), 8080));
+            std::cout << "Подключение к " << target_ip << ":55555...\n";
+            socket.connect(tcp::endpoint(boost::asio::ip::make_address(target_ip), 55555));
             std::cout << "Успешное подключение к серверу!\n";
         }
 
@@ -236,13 +310,11 @@ int main() {
             std::string text = get_user_input();
             if (text.empty()) continue;
 
-            // --- БЛОК ВЫХОДА ---
             if (text == "exit" || text == "Exit" || text == "выйти" || text == "Выйти") {
                 std::cout << "\nОтключение от чата...\n";
-                socket.close(); // Разрываем соединение
-                break;          // Выходим из цикла и программы
+                socket.close();
+                break; 
             }
-            // -------------------
 
             std::vector<unsigned char> encrypted = session.encryptMessage(text);
             uint32_t len = encrypted.size();
@@ -254,6 +326,9 @@ int main() {
     } catch (const std::exception& e) {
         std::cerr << "Критическая ошибка: " << e.what() << "\n";
     }
+
+    // Чистим за собой порт на роутере перед закрытием приложения и пуки каки
+    closePortUPnP(upnp_ctx, port_str);
 
     return 0;
 }
